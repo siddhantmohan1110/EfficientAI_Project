@@ -9,6 +9,7 @@ from collections import defaultdict
 import numpy as np
 import os
 import re
+from utils import qq_plot, qq_plot_outliers
 
 # ------------- CONFIGURATION ------------- #
 
@@ -18,7 +19,7 @@ NUM_CLASSES = 10  # Assume CIFAR-10 for simplicity
 LR = 2e-5
 NUM_EPOCHS = 1  # Keep it low for demonstration
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-COMBINED_SAVE_DIR = "gradient_histograms_combined_wabs"
+COMBINED_SAVE_DIR = "gradient_histograms_combined"
 
 # Create directory to save combined plots
 os.makedirs(COMBINED_SAVE_DIR, exist_ok=True)
@@ -97,22 +98,24 @@ def plot_gradients(gradient_storage, bins=50):
                 grouped_layers[name]["single"] = name
 
     for group_name, subparts in grouped_layers.items():
-        fig, axes = plt.subplots(2, len(subparts), figsize=(6 * len(subparts), 10))
+
+        fig, axes = plt.subplots(3, len(subparts), figsize=(6 * len(subparts), 10))
         if len(subparts) == 1:
-            axes = np.array([[axes[0]], [axes[1]]])
+            axes = np.array([[axes[0]], [axes[1]], [axes[2]]])
 
         for col, (param, name) in enumerate(subparts.items()):
-            #grads = torch.abs(torch.cat(gradient_storage[name]))
-
-            grads = torch.cat(gradient_storage[name])
+            #grads = torch.cat(gradient_storage[name])
+            grads = torch.abs(torch.cat(gradient_storage[name]))
+            mean, std = grads.mean().item(), grads.std().item()
 
             nonzero_grads = grads[grads != 0]
             if nonzero_grads.numel() == 0:
                 continue
 
-            mean, std = grads.mean().item(), grads.std().item()
             log_grads = torch.log(nonzero_grads.abs())
             mean_log, std_log = log_grads.mean().item(), log_grads.std().item()
+
+            theoretical_quantiles, empirical_quantiles, percent_retained = qq_plot_outliers(nonzero_grads.abs())
 
             freq, bins_ = np.histogram(grads.numpy(), bins=bins, range=(mean - 3 * std, mean + 3 * std), density=False)
             freq_log, bins_log = np.histogram(log_grads.numpy(), bins=bins, range=(mean_log - 3 * std_log, mean_log + 3 * std_log), density=False)
@@ -124,12 +127,22 @@ def plot_gradients(gradient_storage, bins=50):
             ax1.set_ylabel("Count")
             ax1.grid(True)
 
+            # 4. Plot the Q-Q plot
             ax2 = axes[1][col]
-            ax2.bar(bins_log[:-1], freq_log, width=np.diff(bins_log), edgecolor="black", align="edge", alpha=0.7)
-            ax2.set_title(f"log(|Grad|): Mean={mean_log:.2f}, Std={std_log:.2f}")
-            ax2.set_xlabel("log(|Grad|)")
-            ax2.set_ylabel("Count")
+            ax2.plot(theoretical_quantiles, empirical_quantiles, 'o', label='Empirical vs Theoretical')
+            ax2.plot(theoretical_quantiles, theoretical_quantiles, 'r--', label='Ideal Fit (y=x)')
+            ax2.set_title('Q-Q Plot: Gradients vs Log-Normal Distribution with {} deviation'.format(np.round(percent_retained)))
+            ax2.set_xlabel('Theoretical Quantiles (Log-Normal)')
+            ax2.set_ylabel('Empirical Quantiles (Gradients)')
+            ax2.legend()
             ax2.grid(True)
+
+            ax3 = axes[2][col]
+            ax3.bar(bins_log[:-1], freq_log, width=np.diff(bins_log), edgecolor="black", align="edge", alpha=0.7)
+            ax3.set_title(f"log(|Grad|): Mean={mean_log:.2f}, Std={std_log:.2f}")
+            ax3.set_xlabel("log(|Grad|)")
+            ax3.set_ylabel("Count")
+            ax3.grid(True)
 
         fig.tight_layout()
         plt.savefig(os.path.join(COMBINED_SAVE_DIR, f"{group_name.replace('.', '_')}_grouped.png"))
