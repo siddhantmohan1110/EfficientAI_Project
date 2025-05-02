@@ -9,7 +9,7 @@ from collections import defaultdict
 import numpy as np
 import os
 import re
-from scipy.stats import norm, laplace, t, lognorm, cauchy, pareto
+from scipy.stats import norm, laplace, t, lognorm, cauchy, pareto, logistic, invgamma
 
 # --- Configuration --- #
 MODEL_NAME = "google/vit-base-patch16-224"
@@ -88,9 +88,15 @@ def compute_qq(data, dist, absval=False):
     elif dist == 'cauchy':
         loc, scale = cauchy.fit(data)
         theoretical = cauchy.ppf(probs, loc=loc, scale=scale)
+    elif dist == 'logistic':
+        loc, scale = logistic.fit(data)
+        theoretical = logistic.ppf(probs, loc=loc, scale=scale)
     elif dist == 'pareto':
         b, loc, scale = pareto.fit(data)
         theoretical = pareto.ppf(probs, b, loc=loc, scale=scale)
+    elif dist == 'invgamma':
+        b, loc, scale = invgamma.fit(data)
+        theoretical = invgamma.ppf(probs, b, loc=loc, scale=scale)
     else:
         raise ValueError(f"Unsupported distribution: {dist}")
 
@@ -109,9 +115,9 @@ def plot_gradients(storage, bins=50):
 
     i=0
     for gname, parts in grouped.items():
-        fig, axs = plt.subplots(4, len(parts), figsize=(6 * len(parts), 15))
+        fig, axs = plt.subplots(3, len(parts), figsize=(6 * len(parts), 15))
         if len(parts) == 1:
-            axs = np.array([[axs[0]], [axs[1]], [axs[2]], [axs[3]]])
+            axs = np.array([[axs[0]], [axs[1]], [axs[2]]])
 
         for col, (param, name) in enumerate(parts.items()):
             grads = torch.cat(storage[name])
@@ -132,31 +138,30 @@ def plot_gradients(storage, bins=50):
             axs[0][col].set_xlabel("Grad")
             axs[0][col].set_ylabel("Count")
 
-            axs[1][col].bar(b2[:-1], f2, width=np.diff(b2), edgecolor="black")
-            axs[1][col].set_title(f"log(|Grad|): Mean={mlog:.2f}, Std={slog:.2f}")
-            axs[1][col].set_xlabel("log(|Grad|)")
+            # axs[1][col].bar(b2[:-1], f2, width=np.diff(b2), edgecolor="black")
+            # axs[1][col].set_title(f"log(|Grad|): Mean={mlog:.2f}, Std={slog:.2f}")
+            # axs[1][col].set_xlabel("log(|Grad|)")
 
-            for d in ['laplace']:
+            centred = ['normal', 'laplace', 'logistic']
+            heavy_tailed = ['lognorm', 'pareto', 'invgamma']
+
+            for d in centred:
                 tq, eq = compute_qq(grads, d)
+                axs[1][col].plot(tq, eq, label=d)
+            axs[1][col].plot(tq, tq, 'k--')
+            axs[1][col].set_title("Q-Q Plot (Centered)")
+            axs[1][col].legend()
+
+            for d in heavy_tailed:
+                tq, eq = compute_qq(abs_grads, d)
                 axs[2][col].plot(tq, eq, label=d)
             axs[2][col].plot(tq, tq, 'k--')
-            axs[2][col].set_title("Q-Q Plot (Centered)")
+            axs[2][col].set_title("Q-Q Plot (Heavy-Tailed)")
             axs[2][col].legend()
-
-            for d in ['cauchy']:
-                tq, eq = compute_qq(abs_grads, d)
-                axs[3][col].plot(tq, eq, label=d)
-            axs[3][col].plot(tq, tq, 'k--')
-            axs[3][col].set_title("Q-Q Plot (Heavy-Tailed)")
-            axs[3][col].legend()
 
         fig.tight_layout()
         plt.savefig(os.path.join(SAVE_DIR, f"{gname.replace('.', '_')}_grouped.png"))
-        plt.close()
-
-        i+=1
-        if i==2:
-            break
+        plt.close(fig)
 
 # --- Execution --- #
 if __name__=='__main__':
