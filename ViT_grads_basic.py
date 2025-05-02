@@ -4,148 +4,166 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from transformers import ViTForImageClassification, ViTFeatureExtractor
+from transformers import ViTForImageClassification
 from collections import defaultdict
 import numpy as np
 import os
 import re
-from utils import qq_plot, qq_plot_outliers
+from scipy.stats import norm, laplace, t, lognorm, cauchy, pareto
 
-# ------------- CONFIGURATION ------------- #
-
+# --- Configuration --- #
 MODEL_NAME = "google/vit-base-patch16-224"
 BATCH_SIZE = 8
-NUM_CLASSES = 10  # Assume CIFAR-10 for simplicity
+NUM_CLASSES = 10
 LR = 2e-5
-NUM_EPOCHS = 1  # Keep it low for demonstration
+NUM_EPOCHS = 1
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-COMBINED_SAVE_DIR = "gradient_histograms_combined"
+SAVE_DIR = "gradient_histograms_combined"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Create directory to save combined plots
-os.makedirs(COMBINED_SAVE_DIR, exist_ok=True)
+# --- Data Loader --- #
+def get_data_loader():
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    dataset = datasets.CIFAR10(root="./data", train=True, transform=transform, download=True)
+    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-# ------------- DATA PREPARATION ------------- #
+# --- Model and Optimizer --- #
+def setup_model():
+    model = ViTForImageClassification.from_pretrained(MODEL_NAME)
+    model.classifier = nn.Linear(model.classifier.in_features, NUM_CLASSES)
+    return model.to(DEVICE), optim.AdamW(model.parameters(), lr=LR), nn.CrossEntropyLoss()
 
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-])
+# --- Gradient Hooking --- #
+def register_hooks(model, storage):
+    def save_grad(name):
+        def hook(_, __, grad_output):
+            if grad_output[0] is not None:
+                storage[name].append(grad_output[0].detach().cpu().flatten())
+        return hook
 
-train_dataset = datasets.CIFAR10(root="./data", train=True, transform=transform, download=True)
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Linear, nn.Conv2d, nn.LayerNorm)):
+            module.register_full_backward_hook(save_grad(name))
 
-# ------------- MODEL SETUP ------------- #
+# --- Training --- #
+def train(model, loader, optimizer, criterion, gradient_storage):
+    model.train()
+    for epoch in range(NUM_EPOCHS):
+        for idx, (inputs, labels) in enumerate(loader):
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(inputs).logits
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            print(f"Epoch {epoch+1}, Batch {idx+1}, Loss: {loss.item():.4f}")
+            if idx == 10:
+                return
 
-model = ViTForImageClassification.from_pretrained(MODEL_NAME)
-model = model.to(DEVICE)
+# --- Q-Q Plot Utility --- #
+def compute_qq(data, dist, absval=False):
+    data = data.cpu().numpy()
+    if absval:
+        data = np.abs(data)
+    data = data[np.isfinite(data) & (data != 0)]
+    probs = np.linspace(0.01, 0.99, 100)
+    empirical = np.quantile(data, probs)
 
-in_features = model.classifier.in_features
-model.classifier = nn.Linear(in_features, NUM_CLASSES).to(DEVICE)
+    if dist == 'normal':
+        loc, scale = norm.fit(data)
+        theoretical = norm.ppf(probs, loc=loc, scale=scale)
+    elif dist == 'laplace':
+        loc, scale = laplace.fit(data)
+        theoretical = laplace.ppf(probs, loc=loc, scale=scale)
+    elif dist == 't':
+        shape, loc, scale = t.fit(data)
+        theoretical = t.ppf(probs, df=3, loc=loc, scale=scale)
+    elif dist == 'lognorm':
+        shape, loc, scale = lognorm.fit(data, floc=0)
+        theoretical = lognorm.ppf(probs, shape, loc=loc, scale=scale)
+    elif dist == 'cauchy':
+        loc, scale = cauchy.fit(data)
+        theoretical = cauchy.ppf(probs, loc=loc, scale=scale)
+    elif dist == 'pareto':
+        b, loc, scale = pareto.fit(data)
+        theoretical = pareto.ppf(probs, b, loc=loc, scale=scale)
+    else:
+        raise ValueError(f"Unsupported distribution: {dist}")
 
-optimizer = optim.AdamW(model.parameters(), lr=LR)
-criterion = nn.CrossEntropyLoss()
+    return theoretical, empirical
 
-# ------------- GRADIENT COLLECTION SETUP ------------- #
-
-gradient_storage = defaultdict(list)
-
-def save_gradient(name):
-    def hook(module, grad_input, grad_output):
-        if grad_output[0] is not None:
-            gradient_storage[name].append(grad_output[0].detach().cpu().flatten())
-    return hook
-
-for name, module in model.named_modules():
-    if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d) or isinstance(module, nn.LayerNorm):
-        module.register_full_backward_hook(save_gradient(name))
-
-# ------------- TRAINING LOOP ------------- #
-
-model.train()
-
-for epoch in range(NUM_EPOCHS):
-    for batch_idx, (inputs, targets) in enumerate(train_loader):
-        inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
-
-        optimizer.zero_grad()
-        outputs = model(inputs).logits
-        loss = criterion(outputs, targets)
-
-        loss.backward()
-        optimizer.step()
-
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Batch [{batch_idx+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
-
-        if batch_idx == 10:
-            break
-
-# ------------- GRADIENT HISTOGRAM PLOTTING ------------- #
-
-def plot_gradients(gradient_storage, bins=50):
-    grouped_layers = defaultdict(dict)
-
-    for name, grads_list in gradient_storage.items():
+# --- Plotting --- #
+def plot_gradients(storage, bins=50):
+    grouped = defaultdict(dict)
+    for name in storage:
         match = re.search(r'encoder\.layer\.(\d+)\.(.*?)\.(.*)', name)
         if match:
-            layer_id, subblock, param = match.groups()
-            key = f"layer_{layer_id}_{subblock}"
-            grouped_layers[key][param] = name
+            lid, sub, param = match.groups()
+            grouped[f"layer_{lid}_{sub}"][param] = name
         else:
-            if name.startswith("classifier") or "pooler" in name:
-                grouped_layers["classifier_head"][name] = name
-            else:
-                grouped_layers[name]["single"] = name
+            grouped["classifier_head"][name] = name
 
-    for group_name, subparts in grouped_layers.items():
+    i=0
+    for gname, parts in grouped.items():
+        fig, axs = plt.subplots(4, len(parts), figsize=(6 * len(parts), 15))
+        if len(parts) == 1:
+            axs = np.array([[axs[0]], [axs[1]], [axs[2]], [axs[3]]])
 
-        fig, axes = plt.subplots(3, len(subparts), figsize=(6 * len(subparts), 10))
-        if len(subparts) == 1:
-            axes = np.array([[axes[0]], [axes[1]], [axes[2]]])
-
-        for col, (param, name) in enumerate(subparts.items()):
-            #grads = torch.cat(gradient_storage[name])
-            grads = torch.abs(torch.cat(gradient_storage[name]))
-            mean, std = grads.mean().item(), grads.std().item()
-
-            nonzero_grads = grads[grads != 0]
-            if nonzero_grads.numel() == 0:
+        for col, (param, name) in enumerate(parts.items()):
+            grads = torch.cat(storage[name])
+            nonzero = grads[grads != 0]
+            if nonzero.numel() == 0:
                 continue
 
-            log_grads = torch.log(nonzero_grads.abs())
-            mean_log, std_log = log_grads.mean().item(), log_grads.std().item()
+            abs_grads = nonzero.abs()
+            log_grads = torch.log(abs_grads)
+            m, s = grads.mean().item(), grads.std().item()
+            mlog, slog = log_grads.mean().item(), log_grads.std().item()
 
-            theoretical_quantiles, empirical_quantiles, percent_retained = qq_plot_outliers(nonzero_grads.abs())
+            f1, b1 = np.histogram(grads.numpy(), bins=bins, range=(m - 3*s, m + 3*s))
+            f2, b2 = np.histogram(log_grads.numpy(), bins=bins, range=(mlog - 3*slog, mlog + 3*slog))
 
-            freq, bins_ = np.histogram(grads.numpy(), bins=bins, range=(mean - 3 * std, mean + 3 * std), density=False)
-            freq_log, bins_log = np.histogram(log_grads.numpy(), bins=bins, range=(mean_log - 3 * std_log, mean_log + 3 * std_log), density=False)
+            axs[0][col].bar(b1[:-1], f1, width=np.diff(b1), edgecolor="black")
+            axs[0][col].set_title(f"{gname}: {param}\nMean={m:.2e}, Std={s:.2e}")
+            axs[0][col].set_xlabel("Grad")
+            axs[0][col].set_ylabel("Count")
 
-            ax1 = axes[0][col]
-            ax1.bar(bins_[:-1], freq, width=np.diff(bins_), edgecolor="black", align="edge", alpha=0.7)
-            ax1.set_title(f"{group_name}: {param}\nMean={mean:.2e}, Std={std:.2e}")
-            ax1.set_xlabel("Grad Value")
-            ax1.set_ylabel("Count")
-            ax1.grid(True)
+            axs[1][col].bar(b2[:-1], f2, width=np.diff(b2), edgecolor="black")
+            axs[1][col].set_title(f"log(|Grad|): Mean={mlog:.2f}, Std={slog:.2f}")
+            axs[1][col].set_xlabel("log(|Grad|)")
 
-            # 4. Plot the Q-Q plot
-            ax2 = axes[1][col]
-            ax2.plot(theoretical_quantiles, empirical_quantiles, 'o', label='Empirical vs Theoretical')
-            ax2.plot(theoretical_quantiles, theoretical_quantiles, 'r--', label='Ideal Fit (y=x)')
-            ax2.set_title('Q-Q Plot: Gradients vs Log-Normal Distribution with {} deviation'.format(np.round(percent_retained)))
-            ax2.set_xlabel('Theoretical Quantiles (Log-Normal)')
-            ax2.set_ylabel('Empirical Quantiles (Gradients)')
-            ax2.legend()
-            ax2.grid(True)
+            for d in ['laplace']:
+                tq, eq = compute_qq(grads, d)
+                axs[2][col].plot(tq, eq, label=d)
+            axs[2][col].plot(tq, tq, 'k--')
+            axs[2][col].set_title("Q-Q Plot (Centered)")
+            axs[2][col].legend()
 
-            ax3 = axes[2][col]
-            ax3.bar(bins_log[:-1], freq_log, width=np.diff(bins_log), edgecolor="black", align="edge", alpha=0.7)
-            ax3.set_title(f"log(|Grad|): Mean={mean_log:.2f}, Std={std_log:.2f}")
-            ax3.set_xlabel("log(|Grad|)")
-            ax3.set_ylabel("Count")
-            ax3.grid(True)
+            for d in ['cauchy']:
+                tq, eq = compute_qq(abs_grads, d)
+                axs[3][col].plot(tq, eq, label=d)
+            axs[3][col].plot(tq, tq, 'k--')
+            axs[3][col].set_title("Q-Q Plot (Heavy-Tailed)")
+            axs[3][col].legend()
 
         fig.tight_layout()
-        plt.savefig(os.path.join(COMBINED_SAVE_DIR, f"{group_name.replace('.', '_')}_grouped.png"))
+        plt.savefig(os.path.join(SAVE_DIR, f"{gname.replace('.', '_')}_grouped.png"))
         plt.close()
 
-plot_gradients(gradient_storage)
+        i+=1
+        if i==2:
+            break
+
+# --- Execution --- #
+if __name__=='__main__':
+    
+    data_loader = get_data_loader()
+    model, optimizer, criterion = setup_model()
+    grad_storage = defaultdict(list)
+    register_hooks(model, grad_storage)
+    train(model, data_loader, optimizer, criterion, grad_storage)
+    plot_gradients(grad_storage)
