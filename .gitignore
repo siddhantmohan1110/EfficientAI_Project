@@ -177,3 +177,7 @@ cython_debug/
 data/
 *.png
 gradient*/
+
+#Mac
+.DS_Store
+todo.txt

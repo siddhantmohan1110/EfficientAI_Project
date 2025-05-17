@@ -4,11 +4,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from transformers import ViTForImageClassification
+from transformers import ViTForImageClassification, ViTConfig
 from collections import defaultdict
 import numpy as np
 import os
 import re
+import time
 from scipy.stats import norm, laplace, t, lognorm, cauchy, pareto, logistic, invgamma
 
 # --- Configuration --- #
@@ -16,9 +17,9 @@ MODEL_NAME = "google/vit-base-patch16-224"
 BATCH_SIZE = 8
 NUM_CLASSES = 10
 LR = 2e-5
-NUM_EPOCHS = 1
+NUM_EPOCHS = 3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = "gradient_histograms_combined"
+SAVE_DIR = "gradient_histograms_combined_raw_init"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # --- Data Loader --- #
@@ -33,8 +34,13 @@ def get_data_loader():
 
 # --- Model and Optimizer --- #
 def setup_model():
-    model = ViTForImageClassification.from_pretrained(MODEL_NAME)
-    model.classifier = nn.Linear(model.classifier.in_features, NUM_CLASSES)
+    config = ViTConfig.from_pretrained(MODEL_NAME)
+    config.num_labels = NUM_CLASSES
+    model = ViTForImageClassification(config)
+    #model = ViTForImageClassification.from_pretrained(MODEL_NAME)
+    #model.classifier = nn.Linear(model.classifier.in_features, NUM_CLASSES)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params / 1e6:.2f}M")
     return model.to(DEVICE), optim.AdamW(model.parameters(), lr=LR), nn.CrossEntropyLoss()
 
 # --- Gradient Hooking --- #
@@ -50,7 +56,7 @@ def register_hooks(model, storage):
             module.register_full_backward_hook(save_grad(name))
 
 # --- Training --- #
-def train(model, loader, optimizer, criterion, gradient_storage):
+def train(model, loader, optimizer, criterion, gradient_storage=None):
     model.train()
     for epoch in range(NUM_EPOCHS):
         for idx, (inputs, labels) in enumerate(loader):
@@ -63,6 +69,9 @@ def train(model, loader, optimizer, criterion, gradient_storage):
             print(f"Epoch {epoch+1}, Batch {idx+1}, Loss: {loss.item():.4f}")
             if idx == 10:
                 return
+
+    
+    #return
 
 # --- Q-Q Plot Utility --- #
 def compute_qq(data, dist, absval=False):
@@ -113,11 +122,12 @@ def plot_gradients(storage, bins=50):
         else:
             grouped["classifier_head"][name] = name
 
-    i=0
+    ch=0
     for gname, parts in grouped.items():
-        fig, axs = plt.subplots(3, len(parts), figsize=(6 * len(parts), 15))
+        ch+=1
+        fig, axs = plt.subplots(4, len(parts), figsize=(6 * len(parts), 15))
         if len(parts) == 1:
-            axs = np.array([[axs[0]], [axs[1]], [axs[2]]])
+            axs = np.array([[axs[0]], [axs[1]], [axs[2]], [axs[3]]])
 
         for col, (param, name) in enumerate(parts.items()):
             grads = torch.cat(storage[name])
@@ -138,37 +148,49 @@ def plot_gradients(storage, bins=50):
             axs[0][col].set_xlabel("Grad")
             axs[0][col].set_ylabel("Count")
 
-            # axs[1][col].bar(b2[:-1], f2, width=np.diff(b2), edgecolor="black")
-            # axs[1][col].set_title(f"log(|Grad|): Mean={mlog:.2f}, Std={slog:.2f}")
-            # axs[1][col].set_xlabel("log(|Grad|)")
+            axs[1][col].bar(b2[:-1], f2, width=np.diff(b2), edgecolor="black")
+            axs[1][col].set_title(f"log(|Grad|): Mean={mlog:.2f}, Std={slog:.2f}")
+            axs[1][col].set_xlabel("log(|Grad|)")
+            axs[1][col].set_ylabel("Count")
 
             centred = ['normal', 'laplace', 'logistic']
             heavy_tailed = ['lognorm', 'pareto', 'invgamma']
 
             for d in centred:
                 tq, eq = compute_qq(grads, d)
-                axs[1][col].plot(tq, eq, label=d)
-            axs[1][col].plot(tq, tq, 'k--')
-            axs[1][col].set_title("Q-Q Plot (Centered)")
-            axs[1][col].legend()
+                axs[2][col].plot(tq, eq, label=d)
+            axs[2][col].plot(tq, tq, 'k--')
+            axs[2][col].set_title("Q-Q Plot (Centered)")
+            axs[2][col].legend()
+            axs[2][col].set_xlabel("Theoretical")
+            axs[2][col].set_ylabel("Actual")
 
             for d in heavy_tailed:
                 tq, eq = compute_qq(abs_grads, d)
-                axs[2][col].plot(tq, eq, label=d)
-            axs[2][col].plot(tq, tq, 'k--')
-            axs[2][col].set_title("Q-Q Plot (Heavy-Tailed)")
-            axs[2][col].legend()
+                axs[3][col].plot(tq, eq, label=d)
+            axs[3][col].plot(tq, tq, 'k--')
+            axs[3][col].set_title("Q-Q Plot (Heavy-Tailed)")
+            axs[3][col].legend()
+            axs[3][col].set_xlabel("Theoretical")
+            axs[3][col].set_ylabel("Actual")
 
         fig.tight_layout()
         plt.savefig(os.path.join(SAVE_DIR, f"{gname.replace('.', '_')}_grouped.png"))
         plt.close(fig)
+        # if ch==4:
+        #     break
 
 # --- Execution --- #
 if __name__=='__main__':
-    
+
     data_loader = get_data_loader()
     model, optimizer, criterion = setup_model()
     grad_storage = defaultdict(list)
     register_hooks(model, grad_storage)
     train(model, data_loader, optimizer, criterion, grad_storage)
+
+    # t1 = time.time()
+    # train(model, data_loader, optimizer, criterion)
+    # print('Time taken :', time.time() - t1)
+
     plot_gradients(grad_storage)
